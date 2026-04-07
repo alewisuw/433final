@@ -22,18 +22,25 @@ def load_data(path: Path) -> pd.DataFrame:
 
 @st.cache_resource(show_spinner=False)
 def load_models(workdir: Path):
-    t_bundle = None
-    s_bundle = None
+    models_dir = workdir / "models"
+    model_paths = {
+        "Conversion": {
+            "T-learner": models_dir / "t_learner.pkl",
+            "S-learner": models_dir / "s_learner.pkl",
+        },
+        "Visit": {
+            "T-learner": models_dir / "t_learner-visit.pkl",
+            "S-learner": models_dir / "s_learner-visit.pkl",
+        },
+    }
 
-    t_path = workdir / "t_learner.pkl"
-    s_path = workdir / "s_learner.pkl"
+    bundles = {}
+    for family, family_paths in model_paths.items():
+        bundles[family] = {}
+        for learner, path in family_paths.items():
+            bundles[family][learner] = _load_pickle(path) if path.exists() else None
 
-    if t_path.exists():
-        t_bundle = _load_pickle(t_path)
-    if s_path.exists():
-        s_bundle = _load_pickle(s_path)
-
-    return t_bundle, s_bundle
+    return bundles
 
 
 def ensure_columns(df: pd.DataFrame, required_cols: list[str]):
@@ -147,6 +154,25 @@ def evaluate_strategy(name: str, mask: np.ndarray, mu1: np.ndarray, mu0: np.ndar
     }
 
 
+def evaluate_visit_strategy(name: str, mask: np.ndarray, mu1: np.ndarray, mu0: np.ndarray):
+    p = np.where(mask, mu1, mu0)
+    expected_visits = float(np.sum(p))
+    users = len(p)
+    targeted_users = int(mask.sum())
+    visit_rate = expected_visits / users if users > 0 else 0.0
+    treated_visit_rate = float(np.mean(mu1[mask])) if targeted_users > 0 else 0.0
+
+    return {
+        "Scenario": name,
+        "Users": users,
+        "Targeted users": targeted_users,
+        "% of people treated": targeted_users / users if users > 0 else 0.0,
+        "Expected visits": expected_visits,
+        "Expected visit rate": visit_rate,
+        "Expected treated visit rate": treated_visit_rate,
+    }
+
+
 def find_best_target_pct(
     uplift: np.ndarray,
     mu1: np.ndarray,
@@ -175,6 +201,26 @@ def find_best_target_pct(
             best_pct = pct
 
     return best_pct, best_value, metric_col
+
+
+def find_best_target_pct_visit(
+    uplift: np.ndarray,
+    mu1: np.ndarray,
+    mu0: np.ndarray,
+):
+    best_pct = 0
+    best_value = -np.inf
+
+    for pct in range(0, 101):
+        frac = pct / 100.0
+        mask = build_target_mask("Optimized uplift", uplift, frac, np.random.default_rng())
+        metrics = evaluate_visit_strategy("Optimized uplift", mask, mu1, mu0)
+        value = float(metrics["Expected visits"])
+        if value > best_value:
+            best_value = value
+            best_pct = pct
+
+    return best_pct, best_value
 
 
 def plot_sensitivity_with_split_marker(curve_df: pd.DataFrame, value_cols: list[str], target_frac: float, y_axis_title: str):
@@ -219,19 +265,21 @@ def plot_sensitivity_with_split_marker(curve_df: pd.DataFrame, value_cols: list[
 
 def main():
     st.title("Uplift Modeling Scenario Simulator")
-    st.caption("Compare expected conversion rate, revenue, and profit under different treatment strategies.")
+    st.caption("Compare expected outcomes under different treatment strategies.")
 
     workdir = Path(__file__).resolve().parent
-    t_bundle, s_bundle = load_models(workdir)
+    bundles = load_models(workdir)
 
-    if t_bundle is None and s_bundle is None:
-        st.error("No model files found. Add s_learner.pkl and/or t_learner.pkl in this folder.")
+    has_any_model = any(
+        family_bundles.get("T-learner") is not None or family_bundles.get("S-learner") is not None
+        for family_bundles in bundles.values()
+    )
+    if not has_any_model:
+        st.error(
+            "No model files found. Add model PKLs under models/ "
+            "(t_learner.pkl, s_learner.pkl, t_learner-visit.pkl, s_learner-visit.pkl)."
+        )
         st.stop()
-
-    # Apply pending optimized split before creating the slider widget.
-    if "pending_target_pct" in st.session_state:
-        st.session_state.target_pct = int(st.session_state.pending_target_pct)
-        del st.session_state["pending_target_pct"]
 
     with st.sidebar:
         st.header("Data")
@@ -248,158 +296,297 @@ def main():
             st.error("No data file found. Upload a CSV.")
             st.stop()
 
+    conversion_tab, visit_tab = st.tabs(["Conversion Models", "Visit Models"])
+
+    with conversion_tab:
+        st.subheader("Conversion Uplift Simulator")
+        conversion_bundles = bundles["Conversion"]
         available_models = []
-        if t_bundle is not None:
+        if conversion_bundles.get("T-learner") is not None:
             available_models.append("T-learner")
-        if s_bundle is not None:
+        if conversion_bundles.get("S-learner") is not None:
             available_models.append("S-learner")
 
-        model_choice = st.selectbox("Model", available_models)
+        if not available_models:
+            st.info("No conversion model files found in models/. Add t_learner.pkl and/or s_learner.pkl.")
+        else:
+            if "conversion_pending_target_pct" in st.session_state:
+                st.session_state.conversion_target_pct = int(st.session_state.conversion_pending_target_pct)
+                del st.session_state["conversion_pending_target_pct"]
 
-        st.header("Business Assumptions")
-        price = st.number_input("Price per unit", min_value=0.0, value=25.0, step=0.5)
-        unit_cost = st.number_input("Variable cost per unit", min_value=0.0, value=8.0, step=0.5)
-        contact_cost = st.number_input("Marketing cost per treated user", min_value=0.0, value=0.01, step=0.05)
+            c1, c2 = st.columns(2)
+            with c1:
+                model_choice = st.selectbox("Model", available_models, key="conversion_model_choice")
+                target_pct = st.slider("% of people treated", min_value=0, max_value=100, step=1, key="conversion_target_pct")
+            with c2:
+                price = st.number_input("Price per unit", min_value=0.0, value=25.0, step=0.5, key="conversion_price")
+                unit_cost = st.number_input("Variable cost per unit", min_value=0.0, value=8.0, step=0.5, key="conversion_unit_cost")
+                contact_cost = st.number_input("Marketing cost per treated user", min_value=0.0, value=0.01, step=0.05, key="conversion_contact_cost")
+                auto_objective = st.selectbox("Optimize split for", ["Profit", "Revenue"], key="conversion_auto_objective")
+                auto_optimize_clicked = st.button("Find optimal split", key="conversion_auto_optimize")
 
-        st.header("Scenario Controls")
-        if "target_pct" not in st.session_state:
-            st.session_state.target_pct = 30
+            try:
+                t_bundle = conversion_bundles.get("T-learner")
+                s_bundle = conversion_bundles.get("S-learner")
+                mu1, mu0 = predict_uplift(model_choice, sim_df, t_bundle, s_bundle)
+            except Exception as exc:
+                st.error(f"Prediction failed: {exc}")
+                st.stop()
 
-        target_pct = st.slider("% of people treated", min_value=0, max_value=100, step=1, key="target_pct")
-        auto_objective = st.selectbox(
-            "Optimize split for",
-            ["Profit", "Revenue"],
-        )
-        auto_optimize_clicked = st.button("Find optimal split")
+            uplift = mu1 - mu0
+            rng = np.random.default_rng()
+            target_frac = target_pct / 100.0
 
-    try:
-        mu1, mu0 = predict_uplift(model_choice, sim_df, t_bundle, s_bundle)
-    except Exception as exc:
-        st.error(f"Prediction failed: {exc}")
-        st.stop()
+            if auto_optimize_clicked:
+                best_pct, best_value, metric_col = find_best_target_pct(
+                    uplift=uplift,
+                    mu1=mu1,
+                    mu0=mu0,
+                    price=price,
+                    unit_cost=unit_cost,
+                    contact_cost=contact_cost,
+                    objective=auto_objective,
+                )
+                st.session_state.conversion_pending_target_pct = int(best_pct)
+                st.success(f"Optimal split found: {best_pct}% (best {auto_objective.lower()}: ${best_value:,.2f}).")
+                st.rerun()
 
-    uplift = mu1 - mu0
-    rng = np.random.default_rng()
-    target_frac = target_pct / 100.0
+            scenario_defs = [
+                ("Treat none", "Treat none"),
+                ("Treat all", "Treat all"),
+                ("Random split", "Random split"),
+                ("Optimized uplift", "Optimized uplift"),
+            ]
 
-    if auto_optimize_clicked:
-        best_pct, best_value, metric_col = find_best_target_pct(
-            uplift=uplift,
-            mu1=mu1,
-            mu0=mu0,
-            price=price,
-            unit_cost=unit_cost,
-            contact_cost=contact_cost,
-            objective=auto_objective,
-        )
-        st.session_state.pending_target_pct = int(best_pct)
-        st.success(f"Optimal split found: {best_pct}% (best {auto_objective.lower()}: ${best_value:,.2f}).")
-        st.rerun()
+            rows = []
+            for scenario_name, strategy in scenario_defs:
+                mask = build_target_mask(strategy, uplift, target_frac, rng)
+                rows.append(evaluate_strategy(scenario_name, mask, mu1, mu0, price, unit_cost, contact_cost))
 
-    scenario_defs = [
-        ("Treat none", "Treat none"),
-        ("Treat all", "Treat all"),
-        ("Random split", "Random split"),
-        ("Optimized uplift", "Optimized uplift"),
-    ]
+            summary = pd.DataFrame(rows)
 
-    rows = []
-    for scenario_name, strategy in scenario_defs:
-        mask = build_target_mask(strategy, uplift, target_frac, rng)
-        rows.append(evaluate_strategy(scenario_name, mask, mu1, mu0, price, unit_cost, contact_cost))
+            baseline_conversions = float(summary.loc[summary["Scenario"] == "Treat none", "Expected conversions"].iloc[0])
+            baseline_revenue = float(summary.loc[summary["Scenario"] == "Treat none", "Expected revenue"].iloc[0])
+            baseline_profit = float(summary.loc[summary["Scenario"] == "Treat none", "Expected profit"].iloc[0])
 
-    summary = pd.DataFrame(rows)
+            summary["Incremental conversions vs Treat none"] = summary["Expected conversions"] - baseline_conversions
+            summary["Incremental revenue vs Treat none"] = summary["Expected revenue"] - baseline_revenue
+            summary["Incremental profit vs Treat none"] = summary["Expected profit"] - baseline_profit
 
-    baseline_conversions = float(summary.loc[summary["Scenario"] == "Treat none", "Expected conversions"].iloc[0])
-    baseline_revenue = float(summary.loc[summary["Scenario"] == "Treat none", "Expected revenue"].iloc[0])
-    baseline_profit = float(summary.loc[summary["Scenario"] == "Treat none", "Expected profit"].iloc[0])
+            st.subheader("Scenario Comparison")
+            summary_display = summary.copy()
+            summary_display["% of people treated"] = summary_display["% of people treated"].map(lambda v: f"{v:.1%}")
+            summary_display["Expected conversions"] = summary_display["Expected conversions"].map(lambda v: f"{v:.2f}")
+            summary_display["Expected conversion rate"] = summary_display["Expected conversion rate"].map(lambda v: f"{v:.3%}")
+            summary_display["Expected treated conversion rate"] = summary_display["Expected treated conversion rate"].map(lambda v: f"{v:.3%}")
+            summary_display["Expected revenue"] = summary_display["Expected revenue"].map(lambda v: f"${v:,.2f}")
+            summary_display["Expected variable cost"] = summary_display["Expected variable cost"].map(lambda v: f"${v:,.2f}")
+            summary_display["Expected marketing cost"] = summary_display["Expected marketing cost"].map(lambda v: f"${v:,.2f}")
+            summary_display["Expected profit"] = summary_display["Expected profit"].map(lambda v: f"${v:,.2f}")
+            summary_display["Incremental conversions vs Treat none"] = summary_display["Incremental conversions vs Treat none"].map(lambda v: f"{v:.2f}")
+            summary_display["Incremental revenue vs Treat none"] = summary_display["Incremental revenue vs Treat none"].map(lambda v: f"${v:,.2f}")
+            summary_display["Incremental profit vs Treat none"] = summary_display["Incremental profit vs Treat none"].map(lambda v: f"${v:,.2f}")
+            st.table(summary_display)
 
-    summary["Incremental conversions vs Treat none"] = summary["Expected conversions"] - baseline_conversions
-    summary["Incremental revenue vs Treat none"] = summary["Expected revenue"] - baseline_revenue
-    summary["Incremental profit vs Treat none"] = summary["Expected profit"] - baseline_profit
+            optimized_row = summary[summary["Scenario"] == "Optimized uplift"].iloc[0]
+            random_row = summary[summary["Scenario"] == "Random split"].iloc[0]
 
-    st.subheader("Scenario Comparison")
-    summary_display = summary.copy()
-    summary_display["% of people treated"] = summary_display["% of people treated"].map(lambda v: f"{v:.1%}")
-    summary_display["Expected conversions"] = summary_display["Expected conversions"].map(lambda v: f"{v:.2f}")
-    summary_display["Expected conversion rate"] = summary_display["Expected conversion rate"].map(lambda v: f"{v:.3%}")
-    summary_display["Expected treated conversion rate"] = summary_display["Expected treated conversion rate"].map(lambda v: f"{v:.3%}")
-    summary_display["Expected revenue"] = summary_display["Expected revenue"].map(lambda v: f"${v:,.2f}")
-    summary_display["Expected variable cost"] = summary_display["Expected variable cost"].map(lambda v: f"${v:,.2f}")
-    summary_display["Expected marketing cost"] = summary_display["Expected marketing cost"].map(lambda v: f"${v:,.2f}")
-    summary_display["Expected profit"] = summary_display["Expected profit"].map(lambda v: f"${v:,.2f}")
-    summary_display["Incremental conversions vs Treat none"] = summary_display["Incremental conversions vs Treat none"].map(lambda v: f"{v:.2f}")
-    summary_display["Incremental revenue vs Treat none"] = summary_display["Incremental revenue vs Treat none"].map(lambda v: f"${v:,.2f}")
-    summary_display["Incremental profit vs Treat none"] = summary_display["Incremental profit vs Treat none"].map(lambda v: f"${v:,.2f}")
-    st.table(summary_display)
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Optimized conversion rate", f"{optimized_row['Expected conversion rate']:.2%}", f"{optimized_row['Expected conversion rate'] - random_row['Expected conversion rate']:.2%} vs random")
+            m2.metric("Optimized expected revenue", f"${optimized_row['Expected revenue']:,.2f}", f"${optimized_row['Expected revenue'] - random_row['Expected revenue']:,.2f} vs random")
+            m3.metric("Optimized expected profit", f"${optimized_row['Expected profit']:,.2f}", f"${optimized_row['Expected profit'] - random_row['Expected profit']:,.2f} vs random")
 
-    optimized_row = summary[summary["Scenario"] == "Optimized uplift"].iloc[0]
-    random_row = summary[summary["Scenario"] == "Random split"].iloc[0]
+            st.subheader("Profit by % of People Treated")
+            rates = np.linspace(0, 1, 21)
+            curve_rows = []
+            for r in rates:
+                random_mask = build_target_mask("Random split", uplift, float(r), rng)
+                optimized_mask = build_target_mask("Optimized uplift", uplift, float(r), rng)
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Optimized conversion rate", f"{optimized_row['Expected conversion rate']:.2%}", f"{optimized_row['Expected conversion rate'] - random_row['Expected conversion rate']:.2%} vs random")
-    c2.metric("Optimized expected revenue", f"${optimized_row['Expected revenue']:,.2f}", f"${optimized_row['Expected revenue'] - random_row['Expected revenue']:,.2f} vs random")
-    c3.metric("Optimized expected profit", f"${optimized_row['Expected profit']:,.2f}", f"${optimized_row['Expected profit'] - random_row['Expected profit']:,.2f} vs random")
+                random_metrics = evaluate_strategy("Random split", random_mask, mu1, mu0, price, unit_cost, contact_cost)
+                optimized_metrics = evaluate_strategy("Optimized uplift", optimized_mask, mu1, mu0, price, unit_cost, contact_cost)
 
-    st.subheader("Profit by % of People Treated")
-    rates = np.linspace(0, 1, 21)
-    curve_rows = []
-    for r in rates:
-        random_mask = build_target_mask("Random split", uplift, float(r), rng)
-        optimized_mask = build_target_mask("Optimized uplift", uplift, float(r), rng)
+                curve_rows.append(
+                    {
+                        "% of people treated": r,
+                        "Random profit": random_metrics["Expected profit"],
+                        "Optimized profit": optimized_metrics["Expected profit"],
+                        "Random revenue": random_metrics["Expected revenue"],
+                        "Optimized revenue": optimized_metrics["Expected revenue"],
+                        "Random conversions": random_metrics["Expected conversions"],
+                        "Optimized conversions": optimized_metrics["Expected conversions"],
+                    }
+                )
 
-        random_metrics = evaluate_strategy("Random split", random_mask, mu1, mu0, price, unit_cost, contact_cost)
-        optimized_metrics = evaluate_strategy("Optimized uplift", optimized_mask, mu1, mu0, price, unit_cost, contact_cost)
+            curve_df = pd.DataFrame(curve_rows).set_index("% of people treated")
+            plot_sensitivity_with_split_marker(
+                curve_df=curve_df,
+                value_cols=["Random profit", "Optimized profit"],
+                target_frac=target_frac,
+                y_axis_title="Expected profit",
+            )
 
-        curve_rows.append(
-            {
-                "% of people treated": r,
-                "Random profit": random_metrics["Expected profit"],
-                "Optimized profit": optimized_metrics["Expected profit"],
-                "Random revenue": random_metrics["Expected revenue"],
-                "Optimized revenue": optimized_metrics["Expected revenue"],
-                "Random conversions": random_metrics["Expected conversions"],
-                "Optimized conversions": optimized_metrics["Expected conversions"],
-            }
-        )
+            st.subheader("Revenue by % of People Treated")
+            plot_sensitivity_with_split_marker(
+                curve_df=curve_df,
+                value_cols=["Random revenue", "Optimized revenue"],
+                target_frac=target_frac,
+                y_axis_title="Expected revenue",
+            )
 
-    curve_df = pd.DataFrame(curve_rows).set_index("% of people treated")
-    plot_sensitivity_with_split_marker(
-        curve_df=curve_df,
-        value_cols=["Random profit", "Optimized profit"],
-        target_frac=target_frac,
-        y_axis_title="Expected profit",
-    )
+            st.subheader("Conversion by % of People Treated")
+            plot_sensitivity_with_split_marker(
+                curve_df=curve_df,
+                value_cols=["Random conversions", "Optimized conversions"],
+                target_frac=target_frac,
+                y_axis_title="Expected conversions",
+            )
 
-    st.subheader("Revenue by % of People Treated")
-    plot_sensitivity_with_split_marker(
-        curve_df=curve_df,
-        value_cols=["Random revenue", "Optimized revenue"],
-        target_frac=target_frac,
-        y_axis_title="Expected revenue",
-    )
+            results = sim_df.copy()
+            results["p_conversion_treated"] = mu1
+            results["p_conversion_control"] = mu0
+            results["uplift"] = uplift
+            results["recommended_treatment"] = (np.argsort(np.argsort(-uplift)) < int(round(len(uplift) * target_frac))).astype(int)
 
-    st.subheader("Conversion by % of People Treated")
-    plot_sensitivity_with_split_marker(
-        curve_df=curve_df,
-        value_cols=["Random conversions", "Optimized conversions"],
-        target_frac=target_frac,
-        y_axis_title="Expected conversions",
-    )
+            csv_data = results.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download scored results (CSV)",
+                data=csv_data,
+                file_name="uplift_scored_results_conversion.csv",
+                mime="text/csv",
+                key="conversion_download",
+            )
 
-    results = sim_df.copy()
-    results["p_conversion_treated"] = mu1
-    results["p_conversion_control"] = mu0
-    results["uplift"] = uplift
-    results["recommended_treatment"] = (np.argsort(np.argsort(-uplift)) < int(round(len(uplift) * target_frac))).astype(int)
+    with visit_tab:
+        st.subheader("Visit Uplift Simulator")
+        visit_bundles = bundles["Visit"]
+        available_models = []
+        if visit_bundles.get("T-learner") is not None:
+            available_models.append("T-learner")
+        if visit_bundles.get("S-learner") is not None:
+            available_models.append("S-learner")
 
-    csv_data = results.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download scored results (CSV)",
-        data=csv_data,
-        file_name="uplift_scored_results.csv",
-        mime="text/csv",
-    )
+        if not available_models:
+            st.info("No visit model files found in models/. Add t_learner-visit.pkl and/or s_learner-visit.pkl.")
+        else:
+            if "visit_pending_target_pct" in st.session_state:
+                st.session_state.visit_target_pct = int(st.session_state.visit_pending_target_pct)
+                del st.session_state["visit_pending_target_pct"]
+
+            c1, c2 = st.columns(2)
+            with c1:
+                model_choice = st.selectbox("Model", available_models, key="visit_model_choice")
+                target_pct = st.slider("% of people treated", min_value=0, max_value=100, step=1, key="visit_target_pct")
+            with c2:
+                auto_optimize_clicked = st.button("Find optimal split (max visits)", key="visit_auto_optimize")
+
+            try:
+                t_bundle = visit_bundles.get("T-learner")
+                s_bundle = visit_bundles.get("S-learner")
+                mu1, mu0 = predict_uplift(model_choice, sim_df, t_bundle, s_bundle)
+            except Exception as exc:
+                st.error(f"Prediction failed: {exc}")
+                st.stop()
+
+            uplift = mu1 - mu0
+            rng = np.random.default_rng()
+            target_frac = target_pct / 100.0
+
+            if auto_optimize_clicked:
+                best_pct, best_value = find_best_target_pct_visit(
+                    uplift=uplift,
+                    mu1=mu1,
+                    mu0=mu0,
+                )
+                st.session_state.visit_pending_target_pct = int(best_pct)
+                st.success(f"Optimal split found: {best_pct}% (best expected visits: {best_value:,.2f}).")
+                st.rerun()
+
+            scenario_defs = [
+                ("Treat none", "Treat none"),
+                ("Treat all", "Treat all"),
+                ("Random split", "Random split"),
+                ("Optimized uplift", "Optimized uplift"),
+            ]
+
+            rows = []
+            for scenario_name, strategy in scenario_defs:
+                mask = build_target_mask(strategy, uplift, target_frac, rng)
+                rows.append(evaluate_visit_strategy(scenario_name, mask, mu1, mu0))
+
+            summary = pd.DataFrame(rows)
+            baseline_visits = float(summary.loc[summary["Scenario"] == "Treat none", "Expected visits"].iloc[0])
+            summary["Incremental visits vs Treat none"] = summary["Expected visits"] - baseline_visits
+
+            st.subheader("Scenario Comparison")
+            summary_display = summary.copy()
+            summary_display["% of people treated"] = summary_display["% of people treated"].map(lambda v: f"{v:.1%}")
+            summary_display["Expected visits"] = summary_display["Expected visits"].map(lambda v: f"{v:.2f}")
+            summary_display["Expected visit rate"] = summary_display["Expected visit rate"].map(lambda v: f"{v:.3%}")
+            summary_display["Expected treated visit rate"] = summary_display["Expected treated visit rate"].map(lambda v: f"{v:.3%}")
+            summary_display["Incremental visits vs Treat none"] = summary_display["Incremental visits vs Treat none"].map(lambda v: f"{v:.2f}")
+            st.table(summary_display)
+
+            optimized_row = summary[summary["Scenario"] == "Optimized uplift"].iloc[0]
+            random_row = summary[summary["Scenario"] == "Random split"].iloc[0]
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Optimized visit rate", f"{optimized_row['Expected visit rate']:.2%}", f"{optimized_row['Expected visit rate'] - random_row['Expected visit rate']:.2%} vs random")
+            m2.metric("Optimized expected visits", f"{optimized_row['Expected visits']:,.2f}", f"{optimized_row['Expected visits'] - random_row['Expected visits']:,.2f} vs random")
+            m3.metric("Incremental visits vs Treat none", f"{optimized_row['Expected visits'] - baseline_visits:,.2f}")
+
+            rates = np.linspace(0, 1, 21)
+            curve_rows = []
+            users = len(mu1)
+            for r in rates:
+                random_mask = build_target_mask("Random split", uplift, float(r), rng)
+                optimized_mask = build_target_mask("Optimized uplift", uplift, float(r), rng)
+
+                random_metrics = evaluate_visit_strategy("Random split", random_mask, mu1, mu0)
+                optimized_metrics = evaluate_visit_strategy("Optimized uplift", optimized_mask, mu1, mu0)
+
+                curve_rows.append(
+                    {
+                        "% of people treated": r,
+                        "Random visits": random_metrics["Expected visits"],
+                        "Optimized visits": optimized_metrics["Expected visits"],
+                        "Random visit rate": random_metrics["Expected visits"] / users if users > 0 else 0.0,
+                        "Optimized visit rate": optimized_metrics["Expected visits"] / users if users > 0 else 0.0,
+                    }
+                )
+
+            curve_df = pd.DataFrame(curve_rows).set_index("% of people treated")
+
+            st.subheader("Visits by % of People Treated")
+            plot_sensitivity_with_split_marker(
+                curve_df=curve_df,
+                value_cols=["Random visits", "Optimized visits"],
+                target_frac=target_frac,
+                y_axis_title="Expected visits",
+            )
+
+            st.subheader("Visit Rate by % of People Treated")
+            plot_sensitivity_with_split_marker(
+                curve_df=curve_df,
+                value_cols=["Random visit rate", "Optimized visit rate"],
+                target_frac=target_frac,
+                y_axis_title="Expected visit rate",
+            )
+
+            results = sim_df.copy()
+            results["p_visit_treated"] = mu1
+            results["p_visit_control"] = mu0
+            results["uplift"] = uplift
+            results["recommended_treatment"] = (np.argsort(np.argsort(-uplift)) < int(round(len(uplift) * target_frac))).astype(int)
+
+            csv_data = results.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download scored visit results (CSV)",
+                data=csv_data,
+                file_name="uplift_scored_results_visit.csv",
+                mime="text/csv",
+                key="visit_download",
+            )
 
 
 if __name__ == "__main__":
