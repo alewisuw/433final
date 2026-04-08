@@ -181,6 +181,7 @@ def find_best_target_pct(
     unit_cost: float,
     contact_cost: float,
     objective: str,
+    max_target_frac: float = 1.0,
 ):
     objective_to_metric = {
         "Revenue": "Expected revenue",
@@ -190,9 +191,12 @@ def find_best_target_pct(
 
     best_pct = 0
     best_value = -np.inf
+    capped_max_target_frac = float(np.clip(max_target_frac, 0.0, 1.0))
 
     for pct in range(0, 101):
         frac = pct / 100.0
+        if frac > capped_max_target_frac:
+            continue
         mask = build_target_mask("Optimized uplift", uplift, frac, np.random.default_rng())
         metrics = evaluate_strategy("Optimized uplift", mask, mu1, mu0, price, unit_cost, contact_cost)
         value = float(metrics[metric_col])
@@ -207,12 +211,16 @@ def find_best_target_pct_visit(
     uplift: np.ndarray,
     mu1: np.ndarray,
     mu0: np.ndarray,
+    max_target_frac: float = 1.0,
 ):
     best_pct = 0
     best_value = -np.inf
+    capped_max_target_frac = float(np.clip(max_target_frac, 0.0, 1.0))
 
     for pct in range(0, 101):
         frac = pct / 100.0
+        if frac > capped_max_target_frac:
+            continue
         mask = build_target_mask("Optimized uplift", uplift, frac, np.random.default_rng())
         metrics = evaluate_visit_strategy("Optimized uplift", mask, mu1, mu0)
         value = float(metrics["Expected visits"])
@@ -322,6 +330,7 @@ def main():
                 price = st.number_input("Price per unit", min_value=0.0, value=25.0, step=0.5, key="conversion_price")
                 unit_cost = st.number_input("Variable cost per unit", min_value=0.0, value=8.0, step=0.5, key="conversion_unit_cost")
                 contact_cost = st.number_input("Marketing cost per treated user", min_value=0.0, value=0.01, step=0.05, key="conversion_contact_cost")
+                budget_limit = st.number_input("Marketing budget cap", min_value=0.0, value=1000.0, step=10.0, key="conversion_budget_limit")
                 auto_objective = st.selectbox("Optimize split for", ["Profit", "Revenue"], key="conversion_auto_objective")
                 auto_optimize_clicked = st.button("Find optimal split", key="conversion_auto_optimize")
 
@@ -336,6 +345,22 @@ def main():
             uplift = mu1 - mu0
             rng = np.random.default_rng()
             target_frac = target_pct / 100.0
+            users = len(uplift)
+
+            if contact_cost <= 0:
+                max_budget_target_frac = 1.0
+                max_budget_target_pct = 100
+            else:
+                max_affordable_users = int(np.floor(budget_limit / contact_cost))
+                max_affordable_users = max(0, min(max_affordable_users, users))
+                max_budget_target_frac = max_affordable_users / users if users > 0 else 0.0
+                max_budget_target_pct = int(np.floor(max_budget_target_frac * 100))
+
+            if target_pct > max_budget_target_pct:
+                st.warning(
+                    f"Selected treatment share exceeds budget cap. "
+                    f"At most {max_budget_target_pct}% can be treated under this budget."
+                )
 
             if auto_optimize_clicked:
                 best_pct, best_value, metric_col = find_best_target_pct(
@@ -346,6 +371,7 @@ def main():
                     unit_cost=unit_cost,
                     contact_cost=contact_cost,
                     objective=auto_objective,
+                    max_target_frac=max_budget_target_frac,
                 )
                 st.session_state.conversion_pending_target_pct = int(best_pct)
                 st.success(f"Optimal split found: {best_pct}% (best {auto_objective.lower()}: ${best_value:,.2f}).")
@@ -478,6 +504,8 @@ def main():
                 model_choice = st.selectbox("Model", available_models, key="visit_model_choice")
                 target_pct = st.slider("% of people treated", min_value=0, max_value=100, step=1, key="visit_target_pct")
             with c2:
+                contact_cost = st.number_input("Marketing cost per treated user", min_value=0.0, value=0.01, step=0.05, key="visit_contact_cost")
+                budget_limit = st.number_input("Marketing budget cap", min_value=0.0, value=1000.0, step=10.0, key="visit_budget_limit")
                 auto_optimize_clicked = st.button("Find optimal split (max visits)", key="visit_auto_optimize")
 
             try:
@@ -491,12 +519,29 @@ def main():
             uplift = mu1 - mu0
             rng = np.random.default_rng()
             target_frac = target_pct / 100.0
+            users = len(uplift)
+
+            if contact_cost <= 0:
+                max_budget_target_frac = 1.0
+                max_budget_target_pct = 100
+            else:
+                max_affordable_users = int(np.floor(budget_limit / contact_cost))
+                max_affordable_users = max(0, min(max_affordable_users, users))
+                max_budget_target_frac = max_affordable_users / users if users > 0 else 0.0
+                max_budget_target_pct = int(np.floor(max_budget_target_frac * 100))
+
+            if target_pct > max_budget_target_pct:
+                st.warning(
+                    f"Selected treatment share exceeds budget cap. "
+                    f"At most {max_budget_target_pct}% can be treated under this budget."
+                )
 
             if auto_optimize_clicked:
                 best_pct, best_value = find_best_target_pct_visit(
                     uplift=uplift,
                     mu1=mu1,
                     mu0=mu0,
+                    max_target_frac=max_budget_target_frac,
                 )
                 st.session_state.visit_pending_target_pct = int(best_pct)
                 st.success(f"Optimal split found: {best_pct}% (best expected visits: {best_value:,.2f}).")
